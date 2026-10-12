@@ -1,0 +1,8 @@
+/build/
+/kvstore
+/kvserver
+/kvserver_multi
+/kvserver_multi_san
+__pycache__/
+*.dSYM/
+.DS_Store
