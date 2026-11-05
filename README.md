@@ -8,9 +8,10 @@ A Redis-style learning project built in C++20: an in-memory key-value store expo
 - Multiple connected clients sharing one store.
 - Per-client input/output buffers, newline framing, partial writes, and RAII socket cleanup.
 - Read backpressure for slow clients, a 4,096-byte command limit, and bounded pending output.
+- Optional append-only-file persistence (`--aof`), crash recovery, and three fsync policies.
 - Automated TCP tests for fragmented requests, concurrent clients, reconnects, slow readers, and connection resets.
 
-The server binds to localhost. Data is lost on restart. This uses a custom text protocol, not Redis RESP. Persistence, expiration, eviction, and performance benchmarks are planned. Linux `epoll` is not implemented.
+The server binds to localhost. Without `--aof`, data is lost on restart. This uses a custom text protocol, not Redis RESP. Log compaction, expiration, eviction, and performance benchmarks are planned. Linux `epoll` is not implemented.
 
 ## Build and run
 
@@ -49,12 +50,20 @@ BYE
 
 Keep one client connected and open another to try concurrent connections. `EXIT` disconnects a client; Ctrl+C stops the server. To choose another port, run `./kvserver_multi 6380`.
 
+To keep data across restarts, add a log file:
+
+```sh
+./kvserver_multi --aof data.aof                  # fsync once per second (default)
+./kvserver_multi --aof data.aof --fsync always   # or: everysec, no
+```
+
 ## Tests
 
 Requires Python 3; no third-party packages:
 
 ```sh
 python3 tests/test_multi.py ./kvserver_multi
+python3 tests/test_persistence.py ./kvserver_multi
 ```
 
 The test creates its own server on an available port and stops it afterward. It covers a slow client draining approximately 4 MB of replies while other clients continue working. These are correctness checks, not throughput benchmarks. The multi-client suite has also passed with AddressSanitizer and UndefinedBehaviorSanitizer on macOS.
@@ -73,7 +82,8 @@ CTest registers the Python tests when Python 3 is available. The one-client test
 
 | Files | Purpose |
 | --- | --- |
-| `kv_store.hpp` | Shared storage and command processing |
+| `kv_store.hpp` | Shared storage, command parsing, and execution |
+| `append_log.hpp` | Append-only log: write, fsync, replay, repair |
 | `main.cpp` | Local terminal program (`kvstore`) |
 | `server.cpp` | One-client TCP example (`kvserver`) |
 | `server_multi.cpp` | Multi-client event loop (`kvserver_multi`) |
@@ -81,9 +91,10 @@ CTest registers the Python tests when Python 3 is available. The one-client test
 | [Lesson 1](LESSON-1.md) | Local storage and C++ fundamentals |
 | [Lesson 2](LESSON-2.md) | TCP sockets and message framing |
 | [Lesson 3](LESSON-3.md) | Nonblocking I/O, readiness, and backpressure |
+| [Lesson 4](LESSON-4.md) | Persistence with an append-only log |
 
 ## Protocol and limits
 
 Commands are uppercase and newline-delimited. Keys have no whitespace; a `SET` value is the remaining text after one separating space. Values may contain spaces, but not newlines. Missing keys return `NOT_FOUND`. Both LF and CRLF endings are supported.
 
-The multi-client server accepts up to 128 clients. It pauses reads when a client's pending output reaches 64 KiB and enforces a 1 MiB hard limit on pending response bytes. Total stored key-value data is not yet bounded, and idle clients have no timeout. See Lesson 3 for details.
+The multi-client server accepts up to 128 clients. It pauses reads when a client's pending output reaches 64 KiB and enforces a 1 MiB hard limit on pending response bytes. Total stored key-value data is not yet bounded, and idle clients have no timeout. See Lesson 3 for details. The append-only log grows with every change and is not yet compacted; see Lesson 4.

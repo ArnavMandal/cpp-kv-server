@@ -1,3 +1,4 @@
+#include "append_log.hpp"
 #include "kv_store.hpp"
 
 #include <arpa/inet.h>
@@ -63,8 +64,21 @@ bool queue_response(Client& client, std::string_view response) {
     return true;
 }
 
+// Write-ahead: record a change in the log BEFORE applying it and replying.
+// If the record cannot be saved, the change does not happen.
+std::string handle_command(KeyValueStore& store, AppendLog* log, const std::string& line) {
+    std::string error;
+    const auto command = parse_command(line, error);
+    if (!command) { return error; }
+    if (log != nullptr && changes_data(store, *command)
+        && !log->append(to_log_record(*command))) {
+        return "ERROR persistence failed";
+    }
+    return apply_command(store, *command);
+}
+
 // Do only one small read per turn. A busy client must let others take turns.
-bool read_ready(Client& client, KeyValueStore& store) {
+bool read_ready(Client& client, KeyValueStore& store, AppendLog* log) {
     char bytes[1024];
     const auto count = ::recv(client.socket.get(), bytes, sizeof(bytes), 0);
     if (count < 0) { return errno == EINTR || would_block(); }
@@ -83,7 +97,7 @@ bool read_ready(Client& client, KeyValueStore& store) {
                 client.line.clear();
                 return queue_response(client, "BYE\n");
             }
-            if (!queue_response(client, execute_command(store, client.line) + '\n')) {
+            if (!queue_response(client, handle_command(store, log, client.line) + '\n')) {
                 return false; // Hard output limit: disconnect this client only.
             }
             client.line.clear();
@@ -117,15 +131,43 @@ bool write_ready(Client& client) {
 
 int main(int argc, char** argv) {
     // An optional port lets tests request port 0 (an OS-selected free port).
+    // --aof FILE turns on persistence; --fsync picks the durability trade-off.
+    constexpr const char* usage =
+        "Usage: kvserver_multi [port] [--aof FILE] [--fsync always|everysec|no]\n";
     int port = 6379;
-    if (argc > 2) { std::cerr << "Usage: kvserver_multi [port]\n"; return 1; }
-    if (argc == 2) {
-        const std::string_view text(argv[1]);
-        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), port);
-        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()
-            || port < 0 || port > 65535) {
-            std::cerr << "Port must be an integer from 0 to 65535\n"; return 1;
+    bool have_port = false;
+    std::string aof_path;
+    FsyncPolicy policy = FsyncPolicy::EverySecond;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i]);
+        if ((arg == "--aof" || arg == "--fsync") && i + 1 < argc) {
+            const std::string_view value(argv[++i]);
+            if (arg == "--aof") { aof_path = value; continue; }
+            if (value == "always") { policy = FsyncPolicy::Always; }
+            else if (value == "everysec") { policy = FsyncPolicy::EverySecond; }
+            else if (value == "no") { policy = FsyncPolicy::Never; }
+            else { std::cerr << usage; return 1; }
+            continue;
         }
+        const auto parsed = std::from_chars(arg.data(), arg.data() + arg.size(), port);
+        if (have_port || parsed.ec != std::errc{} || parsed.ptr != arg.data() + arg.size()
+            || port < 0 || port > 65535) {
+            std::cerr << usage << "Port must be an integer from 0 to 65535\n"; return 1;
+        }
+        have_port = true;
+    }
+
+    // Load saved data before accepting any client, so nobody sees a half-loaded store.
+    KeyValueStore store; // Shared by all clients; only this thread accesses it.
+    AppendLog aof;
+    AppendLog* log = nullptr;
+    if (!aof_path.empty()) {
+        std::string message;
+        if (!aof.open(aof_path, policy, store, message)) {
+            std::cerr << message << '\n'; return 1;
+        }
+        std::cout << message << '\n';
+        log = &aof;
     }
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -151,7 +193,6 @@ int main(int argc, char** argv) {
     std::cout << "Listening on 127.0.0.1:" << ntohs(address.sin_port)
               << " (multiple clients, one thread, poll)\n" << std::flush;
 
-    KeyValueStore store; // Shared by all clients; only this thread accesses it.
     std::unordered_map<int, Client> clients;
     while (true) {
         // Rebuild a snapshot each turn. Only request writes when output exists.
@@ -162,11 +203,14 @@ int main(int argc, char** argv) {
             if (client.pending() != 0) { events |= POLLOUT; }
             watched.push_back({fd, events, 0});
         }
-        // Sleep until ANY watched socket is ready; no busy waiting.
-        if (::poll(watched.data(), watched.size(), -1) < 0) {
+        // Sleep until ANY watched socket is ready, or until an fsync is due.
+        const int timeout = log != nullptr ? log->poll_timeout_ms() : -1;
+        if (::poll(watched.data(), watched.size(), timeout) < 0) {
             if (errno == EINTR) { continue; }
             std::perror("poll"); return 1;
         }
+        // We can't tell which acknowledged writes a failed fsync lost: stop.
+        if (log != nullptr && !log->sync_if_due()) { std::perror("fsync"); return 1; }
         if (watched[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             std::cerr << "Listening socket failed\n"; return 1;
         }
@@ -193,7 +237,7 @@ int main(int argc, char** argv) {
             // A hangup can coexist with unread bytes: receive before closing.
             if (alive && !client.closing && client.pending() < pause_read_at
                 && (event.revents & (POLLIN | POLLHUP))) {
-                alive = read_ready(client, store);
+                alive = read_ready(client, store, log);
             }
             if (alive && (event.revents & (POLLOUT | POLLHUP))) {
                 alive = write_ready(client);
