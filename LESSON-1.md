@@ -90,9 +90,10 @@ The local terminal program has no input size limit. The TCP server limits each c
 
 1. **Done:** local storage and command parsing.
 2. **Done:** one-client TCP server: sockets, partial reads, complete-line buffering, bounded input, partial writes, and connection cleanup.
-3. **Current:** multiple clients with nonblocking sockets and a `poll()` event loop on macOS. Linux `epoll` is an optional later extension, not implemented yet.
-4. Persistence: append operations to a file and recover after restart.
-5. Expiration and eviction: time limits and a memory budget.
-6. Benchmarks: measure throughput and latency, then explain one measured improvement.
+3. **Done:** multiple clients with nonblocking sockets and a `poll()` event loop on macOS. Linux `epoll` is an optional later extension, not implemented yet.
+4. **Done:** persistence: append operations to a file and recover after restart ([Lesson 4](LESSON-4.md)).
+5. **Done:** log compaction in the background with `fork()` and `rename()` ([Lesson 5](LESSON-5.md)).
+6. Expiration and eviction: time limits and a memory budget.
+7. Benchmarks: measure throughput and latency, then explain one measured improvement.
 
-We will add each layer after understanding the previous one. Next: persistence so values survive a server restart.
+We add each layer after understanding the previous one.

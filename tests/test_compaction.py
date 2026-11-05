@@ -3,6 +3,7 @@
 Run: python3 tests/test_compaction.py ./kvserver_multi
 Each test uses a fresh temporary log file and an OS-selected free port.
 """
+import atexit
 import os
 import pathlib
 import re
@@ -15,6 +16,16 @@ import tempfile
 import time
 
 binary = str(pathlib.Path(sys.argv[1]).resolve())
+servers = []
+
+
+@atexit.register
+def stop_servers():
+    # Runs even when an assertion fails, so no test server is left running.
+    for process in servers:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 class Server:
@@ -25,6 +36,7 @@ class Server:
         self.process = subprocess.Popen([binary, '0', *map(str, args)], env=env,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         bufsize=0)  # So select() sees every line.
+        servers.append(self.process)
         while True:
             line = self.read_line()
             match = re.match(r'Listening on 127\.0\.0\.1:(\d+) ', line)
