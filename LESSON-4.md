@@ -92,7 +92,7 @@ If a `write()` fails halfway (for example, a full disk), `append` truncates the 
 ## Trade-offs we accepted
 
 - **Disk writes block the event loop.** Writes to a regular file don't support `EAGAIN` the way sockets do. With `--fsync always`, every client waits for every disk flush. Redis moves `fsync` to a background thread for `everysec`.
-- **The log only grows.** A thousand `SET`s of one key leave a thousand lines, and startup replays all of them. The fix is **compaction**: write a fresh log containing one `SET` per live key, then atomically `rename()` it over the old one.
+- **The log only grows.** A thousand `SET`s of one key leave a thousand lines, and startup replays all of them. The fix is **compaction** ([Lesson 5](LESSON-5.md)): write a fresh log containing one `SET` per live key, then atomically `rename()` it over the old one.
 - **Startup reads the whole file into memory.** Fine for a learning project; a large log would be streamed.
 - **No checksums.** Bit flips that still form a valid command would go undetected. Real logs store a length and CRC per record.
 

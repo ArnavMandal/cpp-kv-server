@@ -32,6 +32,15 @@ public:
     bool remove(const std::string& key) {
         return data_.erase(key) > 0;
     }
+
+    // Lesson 5: visit every entry (in no particular order) without copying them.
+    // A template accepts any callable: a lambda, a function, and so on.
+    template <typename Visit>
+    void for_each(Visit visit) const {
+        for (const auto& [key, value] : data_) {
+            visit(key, value);
+        }
+    }
 };
 
 // Lesson 4: parsing is separate from executing, so the server can decide

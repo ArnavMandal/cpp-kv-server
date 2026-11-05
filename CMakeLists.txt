@@ -19,5 +19,7 @@ if(Python3_Interpreter_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_multi.py $<TARGET_FILE:kvserver_multi>)
     add_test(NAME persistence COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_persistence.py $<TARGET_FILE:kvserver_multi>)
-    set_tests_properties(tcp_protocol tcp_multi persistence PROPERTIES TIMEOUT 30)
+    add_test(NAME compaction COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compaction.py $<TARGET_FILE:kvserver_multi>)
+    set_tests_properties(tcp_protocol tcp_multi persistence compaction PROPERTIES TIMEOUT 30)
 endif()

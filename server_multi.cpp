@@ -12,6 +12,7 @@
 #include <charconv>
 #include <csignal>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <string_view>
 #include <vector>
@@ -78,7 +79,9 @@ std::string handle_command(KeyValueStore& store, AppendLog* log, const std::stri
 }
 
 // Do only one small read per turn. A busy client must let others take turns.
-bool read_ready(Client& client, KeyValueStore& store, AppendLog* log) {
+// compact: starts a background compaction and returns the reply for COMPACT.
+bool read_ready(Client& client, KeyValueStore& store, AppendLog* log,
+                const std::function<std::string()>& compact) {
     char bytes[1024];
     const auto count = ::recv(client.socket.get(), bytes, sizeof(bytes), 0);
     if (count < 0) { return errno == EINTR || would_block(); }
@@ -96,6 +99,11 @@ bool read_ready(Client& client, KeyValueStore& store, AppendLog* log) {
                 client.closing = true;
                 client.line.clear();
                 return queue_response(client, "BYE\n");
+            }
+            if (client.line == "COMPACT") {
+                client.line.clear();
+                if (!queue_response(client, compact() + '\n')) { return false; }
+                continue;
             }
             if (!queue_response(client, handle_command(store, log, client.line) + '\n')) {
                 return false; // Hard output limit: disconnect this client only.
@@ -133,13 +141,24 @@ int main(int argc, char** argv) {
     // An optional port lets tests request port 0 (an OS-selected free port).
     // --aof FILE turns on persistence; --fsync picks the durability trade-off.
     constexpr const char* usage =
-        "Usage: kvserver_multi [port] [--aof FILE] [--fsync always|everysec|no]\n";
+        "Usage: kvserver_multi [port] [--aof FILE] [--fsync always|everysec|no]"
+        " [--compact-min BYTES]\n";
     int port = 6379;
     bool have_port = false;
     std::string aof_path;
     FsyncPolicy policy = FsyncPolicy::EverySecond;
+    std::size_t compact_min = 1024 * 1024; // Don't auto-compact logs under 1 MiB.
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
+        if (arg == "--compact-min" && i + 1 < argc) {
+            const std::string_view value(argv[++i]);
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(),
+                                                compact_min);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
+                std::cerr << usage; return 1;
+            }
+            continue;
+        }
         if ((arg == "--aof" || arg == "--fsync") && i + 1 < argc) {
             const std::string_view value(argv[++i]);
             if (arg == "--aof") { aof_path = value; continue; }
@@ -163,7 +182,7 @@ int main(int argc, char** argv) {
     AppendLog* log = nullptr;
     if (!aof_path.empty()) {
         std::string message;
-        if (!aof.open(aof_path, policy, store, message)) {
+        if (!aof.open(aof_path, policy, compact_min, store, message)) {
             std::cerr << message << '\n'; return 1;
         }
         std::cout << message << '\n';
@@ -194,9 +213,24 @@ int main(int argc, char** argv) {
               << " (multiple clients, one thread, poll)\n" << std::flush;
 
     std::unordered_map<int, Client> clients;
+
+    // Lesson 5: start a background rewrite of the log (COMPACT or automatic).
+    const std::function<std::string()> compact = [&]() -> std::string {
+        if (log == nullptr) { return "ERROR persistence disabled"; }
+        std::vector<int> sockets{listener.get()};
+        for (const auto& entry : clients) { sockets.push_back(entry.first); }
+        std::string message;
+        if (!log->start_compaction(store, sockets, message)) { return "ERROR " + message; }
+        return "COMPACTING";
+    };
+
     while (true) {
         // Rebuild a snapshot each turn. Only request writes when output exists.
         std::vector<pollfd> watched{{listener.get(), POLLIN, 0}};
+        // While a compaction child runs, also wait for its "done" pipe.
+        const int compaction = log != nullptr ? log->compaction_fd() : -1;
+        if (compaction >= 0) { watched.push_back({compaction, POLLIN, 0}); }
+        const std::size_t first_client = watched.size();
         for (const auto& [fd, client] : clients) {
             short events = 0;
             if (!client.closing && client.pending() < pause_read_at) { events |= POLLIN; }
@@ -214,6 +248,12 @@ int main(int argc, char** argv) {
         if (watched[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             std::cerr << "Listening socket failed\n"; return 1;
         }
+        if (compaction >= 0 && watched[1].revents != 0) {
+            std::string message;
+            const bool usable = log->finish_compaction(message);
+            (usable ? std::cout : std::cerr) << message << '\n' << std::flush;
+            if (!usable) { return 1; }
+        }
         if (watched[0].revents & POLLIN) {
             // Bound accepts per turn, so connection bursts cannot hog the loop.
             for (int n = 0; n < 16; ++n) {
@@ -229,7 +269,7 @@ int main(int argc, char** argv) {
                 clients.try_emplace(fd, accepted.release());
             }
         }
-        for (std::size_t i = 1; i < watched.size(); ++i) {
+        for (std::size_t i = first_client; i < watched.size(); ++i) {
             const auto& event = watched[i];
             auto it = clients.find(event.fd);
             auto& client = it->second;
@@ -237,7 +277,7 @@ int main(int argc, char** argv) {
             // A hangup can coexist with unread bytes: receive before closing.
             if (alive && !client.closing && client.pending() < pause_read_at
                 && (event.revents & (POLLIN | POLLHUP))) {
-                alive = read_ready(client, store, log);
+                alive = read_ready(client, store, log, compact);
             }
             if (alive && (event.revents & (POLLOUT | POLLHUP))) {
                 alive = write_ready(client);
@@ -247,6 +287,10 @@ int main(int argc, char** argv) {
             if (!alive || (client.closing && client.pending() == 0)) {
                 clients.erase(it); // Destruction closes exactly this socket.
             }
+        }
+        if (log != nullptr && log->should_compact()) {
+            const std::string result = compact();
+            if (result != "COMPACTING") { std::cerr << "auto-compaction: " << result << '\n'; }
         }
     }
 }
