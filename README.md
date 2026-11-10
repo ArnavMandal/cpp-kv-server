@@ -11,8 +11,9 @@ A Redis-style learning project built in C++20: an in-memory key-value store expo
 - Optional append-only-file persistence (`--aof`), crash recovery, and three fsync policies.
 - Background log compaction (`COMPACT`, or automatic) using `fork()` and an atomic `rename()`.
 - Automated TCP tests for fragmented requests, concurrent clients, reconnects, slow readers, and connection resets.
+- A repeatable throughput/latency benchmark comparing no log and each fsync policy (`bench/`).
 
-The server binds to localhost. Without `--aof`, data is lost on restart. This uses a custom text protocol, not Redis RESP. Expiration, eviction, and performance benchmarks are planned. Linux `epoll` is not implemented.
+The server binds to localhost. Without `--aof`, data is lost on restart. This uses a custom text protocol, not Redis RESP. Expiration and eviction are planned. Linux `epoll` is not implemented.
 
 ## Build and run
 
@@ -70,17 +71,29 @@ python3 tests/test_persistence.py ./kvserver_multi
 python3 tests/test_compaction.py ./kvserver_multi
 ```
 
-The test creates its own server on an available port and stops it afterward. It covers a slow client draining approximately 4 MB of replies while other clients continue working. These are correctness checks, not throughput benchmarks. The multi-client suite has also passed with AddressSanitizer and UndefinedBehaviorSanitizer on macOS.
+The test creates its own server on an available port and stops it afterward. It covers a slow client draining approximately 4 MB of replies while other clients continue working. These are correctness checks; for performance, see [Benchmark](#benchmark). The multi-client suite has also passed with AddressSanitizer and UndefinedBehaviorSanitizer on macOS.
+
+## Benchmark
+
+Build both programs with optimization, then run every persistence mode five times, interleaved:
+
+```sh
+c++ -std=c++20 -O2 server_multi.cpp -o kvserver_multi
+c++ -std=c++20 -O2 -pthread bench/kvbench.cpp -o kvbench
+python3 bench/run_bench.py --note "c++ -O2"
+```
+
+Each run starts a fresh server with an empty log on a free port. Workloads are seeded and verify every reply. The script prints median throughput, p50/p99/p99.9 latency for `GET` and `SET`, and the spread across repeats. It saves these results to `bench/results/`, along with the git commit, binary hashes, OS, CPU, and compiler. Use `--compare OLD.json` to see the change between runs, and `--help` for workload options. On an Apple M2, `--fsync always` cut throughput from about 87k to 30k operations per second. [Lesson 6](LESSON-6.md) explains how to read the results and how far to trust them.
 
 Optional CMake build (CMake 3.16+):
 
 ```sh
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-CTest registers the Python tests when Python 3 is available. The one-client test requires port 6379 to be free. The multi-client test selects a free port automatically.
+CTest registers the Python tests, plus a quick benchmark smoke run, when Python 3 is available. The one-client test requires port 6379 to be free. The multi-client test selects a free port automatically.
 
 ## Project layout and lessons
 
@@ -92,11 +105,13 @@ CTest registers the Python tests when Python 3 is available. The one-client test
 | `server.cpp` | One-client TCP example (`kvserver`) |
 | `server_multi.cpp` | Multi-client event loop (`kvserver_multi`) |
 | `tests/` | End-to-end TCP correctness tests |
+| `bench/` | Load generator (`kvbench`) and benchmark driver |
 | [Lesson 1](LESSON-1.md) | Local storage and C++ fundamentals |
 | [Lesson 2](LESSON-2.md) | TCP sockets and message framing |
 | [Lesson 3](LESSON-3.md) | Nonblocking I/O, readiness, and backpressure |
 | [Lesson 4](LESSON-4.md) | Persistence with an append-only log |
 | [Lesson 5](LESSON-5.md) | Log compaction with `fork()` and `rename()` |
+| [Lesson 6](LESSON-6.md) | Benchmarking persistence: throughput, latency, repeatability |
 
 ## Protocol and limits
 

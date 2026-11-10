@@ -3,6 +3,8 @@
 /kvserver
 /kvserver_multi
 /kvserver_multi_san
+/kvbench
+/bench/results/
 __pycache__/
 *.dSYM/
 .DS_Store
